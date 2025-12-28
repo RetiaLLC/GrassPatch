@@ -1,0 +1,185 @@
+from machine import Pin, I2C, PWM, TouchPad
+from neopixel import NeoPixel
+from time import sleep, ticks_ms, ticks_diff
+import framebuf
+import gc
+
+import sh1106
+
+# Wemos pins - for our and our users' convenience
+"""
+D0 = const(16)
+D1 = const(5)
+D2 = const(4)
+D3 = const(0)
+D4 = const(2)
+D5 = const(14)
+D6 = const(12)
+D7 = const(13)
+D8 = const(15)
+"""
+
+i2c_grass = I2C(0, sda=Pin(34), scl=Pin(36), freq=100000) # I2C object on grass patch pins 34 and 36
+print("I2C sensors found: {}".format(", ".join((hex(i) for i in i2c_grass.scan()))))
+
+mouse_p = 1
+mouse = TouchPad(Pin(mouse_p))
+
+# making all LEDs light up
+i2c_grass.writeto_mem(0x20, 0x06, bytes([0b00000000]))
+i2c_grass.writeto_mem(0x20, 0x02, bytes([0b00000000]))
+# example of only lighting up one LED
+#i2c_grass.writeto_mem(0x20, 0x02, bytes([0b10111111]))
+
+temp_addr = 0x48
+
+def read_sensor(addr):
+    data = list(i2c_grass.readfrom_mem(addr, 0, 2))
+    i = (data[0] << 4) | (data[1] >> 4)
+    return i * 0.0625
+
+print(read_sensor(temp_addr))
+
+# buzzer yippie!
+buzz_p = 38
+buzz = PWM(buzz_p)
+buzz.freq(2048*2)
+
+# example sound
+
+buzz.duty_u16(4095)
+sleep(0.3)
+buzz.duty_u16(0)
+
+tx = Pin(21, Pin.OUT, value=1)
+#rx = Pin(17, Pin.IN, Pin.PULL_UP)
+#while True: print(rx.value())
+
+# I2C screen
+
+i2c = I2C(1, sda=Pin(33), scl=Pin(35), freq=400000) # I2C object on pins 33 and 35, used only on-Nugget
+lcd = sh1106.SH1106_I2C(128, 64, i2c, None, 0x3c, rotate=180)  # SH1106 display on I2C 0x3C, rotated
+# screen init
+lcd.sleep(False)  # Turn on the display
+lcd.fill(0)  # Erase display
+
+# Neopixel
+
+numPixels = 1  # How many pixels are attached to the nugget? If just the built in display, put 1
+pin = Pin(12, Pin.OUT)   # set GPIO15 to output to drive NeoPixels
+
+def get_neopixels(count):
+    return NeoPixel(pin, count)   # create NeoPixel driver on GPIO15 for all neopixels
+
+# Button pins
+
+down_p  = Pin(18, Pin.IN, Pin.PULL_UP)
+up_p    = Pin( 9, Pin.IN, Pin.PULL_UP)
+left_p  = Pin(11, Pin.IN, Pin.PULL_UP)
+right_p = Pin( 7, Pin.IN, Pin.PULL_UP)
+#a_p =     Pin(37, Pin.IN, Pin.PULL_UP)
+#b_p =     Pin(39, Pin.IN, Pin.PULL_UP)
+
+# Button wrapper code for usability
+
+class Buttons():
+    debounce_time = 150 # milliseconds
+
+    def __init__(self, buttons, callbacks={}, aliases={}):
+        self.b = buttons
+        self.cb = callbacks
+        self.b_al = aliases
+        self.values = {name:False for name in buttons}
+        self.debounce = {name:0 for name in buttons}
+
+    def update(self):
+        for name, button in self.b.items():
+            new = not button.value() # inverting the pin here
+            old = self.values[name]
+            if new and not old:
+                # button just pressed, recording that
+                self.values[name] = True
+                # clearing debounce timer if it's set - we only debounce on release
+                self.debounce[name] = None
+                # executing the button callback if available
+                cb = self.cb.get(name, None)
+                if callable(cb):
+                    cb()
+            elif old and not new:
+                # button is released
+                # we debounce only button release
+                # this is so that button presses are processed quicker
+                if not self.debounce[name]:
+                    # starting debounce timer
+                    self.debounce[name] = ticks_ms()
+                else:
+                    if ticks_diff(ticks_ms(), self.debounce[name]) > self.debounce_time:
+                        # button has been de-pressed for long enough
+                        # accepting and moving on
+                        self.values[name] = False
+            elif new:
+                # button still pressed
+                # just removing the debounce timer
+                # in case it's been activated by a bit of bounce on press
+                self.debounce[name] = None
+            else:
+                pass # button long-released
+
+    def __getattr__(self, attr):
+        # lets you get button value by direction - like `buttons.left`
+        if attr in self.b:
+            # return value
+            return self.values[attr]
+        # lets you get button value by color - like `buttons.blue`
+        elif attr in self.b_al:
+            return self.values[self.b_al[attr]]
+
+#buttons = Buttons({"down":down_p, "up":up_p, "left":left_p, "right":right_p, "a":a_p, "b":b_p})
+buttons = Buttons({"down":down_p, "up":up_p, "left":left_p, "right":right_p})
+
+
+# Screen image decompression
+
+def unpack(packed_data):
+    """
+    Decompresses image data using a very simple algorithm described in 'pack'.
+    Returns a bytearray.
+    """
+    i = 0 # index for the unpacked bytearray element that we're currently on
+    # checking the compression format version, for future compatibility in case this algo changes significantly
+    if packed_data[0] != 1:
+        print("Don't know how to decompress this image, format version:", packed_data[0])
+        return None
+    # pre-creating a bytearray of the length we need, initially filled with zeroes
+    # to avoid creating too many useless objects and wasting memory as we unpack
+    unpacked_data = bytearray(packed_data[1])
+    for element in packed_data[2:]: # need to skip two elements - version and length
+        if isinstance(element, int): # just an int, simply putting it into the bytearray
+            unpacked_data[i] = element
+            i += 1
+        else:
+            value, count = element
+            if value == 0: # small optimization
+                # skipping zero-filling since bytearrays are pre-filled with zeroes
+                i += count
+            else:
+                for _ in range(count):
+                    unpacked_data[i] = value
+                    i += 1
+    return unpacked_data
+
+# Showing compressed images
+
+def show_compressed(packed_data, fb_width=124, fb_height=64):
+    data = unpack(packed_data)
+    fb = framebuf.FrameBuffer(data, fb_width, fb_height, framebuf.MONO_VLSB)
+    lcd.fill(0)
+    lcd.blit(fb, 0, 0)
+    lcd.show()
+    del data
+    del fb
+    gc.collect()
+
+cutie_c = [1, 992, [0, 253], 192, [224, 2], 112, 56, 60, [28, 2], [14, 9], [28, 2], 56, 120, 240, 224, 192, 128, [0, 63], 192, 224, 240, 120, 60, 28, [14, 3], [7, 7], 6, [14, 2], 28, 60, 56, 240, 224, 192, 128, [0, 7], 240, 252, 255, 7, 1, [0, 11], 32, [248, 2], [252, 2], 248, 112, [0, 2], 1, 3, 31, 254, 248, 128, [0, 57], 224, 252, 255, 7, 1, [0, 12], 120, [252, 4], 120, [0, 3], 1, 7, 255, 254, 240, [0, 5], 15, 127, 255, 224, 128, [0, 13], [1, 3], [0, 5], 192, 240, 255, 63, 1, [0, 26], 112, [248, 7], 112, [0, 22], 3, 31, 127, 240, 192, 128, [0, 19], 128, 192, 240, 255, 63, 7, [0, 7], 1, 3, 7, 15, 30, 60, 56, 48, [112, 2], [96, 2], [224, 3], 96, [112, 3], [56, 2], 28, 14, 15, 7, 1, [0, 21], 24, 120, 240, 192, 128, [0, 5], 1, 3, 255, 3, 1, [0, 5], 128, 192, 240, 120, 24, [0, 17], 1, 3, 7, 15, 30, 28, [56, 3], [112, 7], 48, [56, 2], 28, 30, 14, 7, 3, 1, [0, 60], 1, 3, 7, 6, 14, [12, 4], 15, 12, 8, [12, 2], [6, 2], [3, 2], 1, [0, 175]]
+dead_c = [1, 992, [0, 137], 1, 3, 15, 31, 127, 255, 254, 248, 240, 192, 128, [0, 4], 128, 192, 240, 252, 254, 255, 63, 31, 7, 3, [0, 50], 1, 3, 15, 31, 127, 255, 254, 248, 240, 192, 128, [0, 4], 128, 192, 240, 252, 254, 255, 63, 31, 7, 3, [0, 30], 3, 7, 31, 191, 255, 254, [248, 2], 254, 255, 31, 15, 7, 1, [0, 61], 3, 7, 31, 191, 255, 254, [248, 2], 254, 255, 31, 15, 7, 1, [0, 33], 128, 224, 240, 252, 254, 127, 31, 15, 3, 7, 31, 127, 255, 254, 248, 240, 192, 128, [0, 57], 128, 224, 240, 252, 254, 127, 31, 15, 3, 7, 31, 127, 255, 254, 248, 240, 192, 128, [0, 27], 32, 56, 60, [63, 3], 15, 3, 1, [0, 8], 3, 15, 31, [63, 2], 62, 60, 48, 32, [0, 20], 112, [248, 7], 112, [0, 20], 32, 56, 60, [63, 3], 15, 3, 1, [0, 8], 3, 15, 31, [63, 2], 62, 60, 48, 32, [0, 61], 24, 120, 240, 192, 128, [0, 5], 1, 3, 255, 3, 1, [0, 5], 128, 192, 240, 120, 24, [0, 102], 1, 3, 7, 6, 14, [12, 4], 15, 12, 8, [12, 2], [6, 2], [3, 2], 1, [0, 175]]
+nyaa_c = [1, 992, [0, 270], 128, 224, [248, 3], 224, 192, [0, 68], 128, 224, [248, 3], 224, 192, [0, 37], 128, 224, 240, 252, 254, 127, 31, 15, 3, 7, 31, 127, 255, 254, 248, 240, 192, 128, [0, 57], 128, 224, 240, 252, 254, 127, 31, 15, 3, 7, 31, 127, 255, 254, 248, 240, 192, 128, [0, 27], 32, 56, 60, [63, 3], 15, 3, 1, [0, 8], 3, 15, 31, [63, 2], 62, 60, 48, 32, [0, 20], 112, [248, 7], 112, [0, 20], 32, 56, 60, [63, 3], 15, 3, 1, [0, 8], 3, 15, 31, [63, 2], 62, 60, 48, 32, [0, 61], 24, 120, 240, 192, 128, [0, 5], 1, 3, 255, 3, 1, [0, 5], 128, 192, 240, 120, 24, [0, 102], 1, 3, 7, 6, 14, [12, 4], 15, 12, 8, [12, 2], [6, 2], [3, 2], 1, [0, 175]]
