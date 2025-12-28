@@ -5,10 +5,10 @@ This repo contains a schematic for the module, as well as datasheets for all of 
 What are you getting?
 
 * A USB Nugget, with its:
-** WiFi and Bluetooth capabilities
-** 128x64 SH1106 OLED display
-** 4 clicky buttons
-** A Neopixel LED
+ * WiFi and Bluetooth capabilities
+ * 128x64 SH1106 OLED display
+ * 4 clicky buttons
+ * A Neopixel LED
 
 It's mounted onto a patch of grass, on which you'll find:
 
@@ -30,3 +30,7 @@ It's mounted onto a patch of grass, on which you'll find:
 - Upload `main.py` and see it play a melody
 
 - Hack away at `main.py` to play with the onboard devices and sensors!
+
+  Notes:
+-  Some components, like the compass and the LoRa modem, will require libraries. For the compass, you can [try out this library](https://github.com/gvalkov/micropython-esp8266-hmc5883l/blob/main/hmc5883l.py), and for the LoRa modem, feel free to refer to one of the SX1262 libraries!
+-  Peruse the files in the `datasheets/` folder to learn more about the components
